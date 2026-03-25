@@ -1,6 +1,8 @@
 const { chromium } = require("playwright");
 
 async function searchCI(query) {
+  console.log("CI LIVE SCRAPER RUNNING");
+
   let browser;
 
   try {
