@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
-const searchStore = require("./stores/jr");
+const searchJR = require("./stores/jr");
+const searchCI = require("./stores/ci");
 
 const app = express();
 app.use(cors());
@@ -17,7 +18,10 @@ app.get("/search", async (req, res) => {
   }
 
   try {
-    const results = await searchStore(query);
+    const jrResults = await searchJR(query);
+    const ciResults = await searchCI(query);
+
+    const results = [...jrResults, ...ciResults];
     res.json(results);
   } catch (error) {
     console.error("Search failed:", error.message);
