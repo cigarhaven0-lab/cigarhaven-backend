@@ -26,7 +26,11 @@ app.get("/search", async (req, res) => {
       stores.map(storeSearch => storeSearch(query))
     );
 
-    const results = resultsArrays.flat();
+    const results = resultsArrays.flat().sort((a, b) => {
+  const priceA = parseFloat(a.price.replace("$", ""));
+  const priceB = parseFloat(b.price.replace("$", ""));
+  return priceA - priceB;
+});
     res.json(results);
   } catch (error) {
     console.error("Search failed:", error.message);
