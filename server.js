@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const searchJR = require("./stores/jr");
 const searchCI = require("./stores/ci");
+const searchThompson = require("./stores/thompson");
 
 const app = express();
 app.use(cors());
@@ -20,8 +21,9 @@ app.get("/search", async (req, res) => {
   try {
     const jrResults = await searchJR(query);
     const ciResults = await searchCI(query);
+    const thompsonResults = await searchThompson(query);
 
-    const results = [...jrResults, ...ciResults];
+    const results = [...jrResults, ...ciResults, ...thompsonResults];
     res.json(results);
   } catch (error) {
     console.error("Search failed:", error.message);
