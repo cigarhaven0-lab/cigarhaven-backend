@@ -1,62 +1,46 @@
 const { chromium } = require("playwright");
 
 async function searchCI(query) {
-  console.log("CI LIVE SCRAPER RUNNING");
+  const browser = await chromium.launch({
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
 
-  let browser;
+  const page = await browser.newPage();
 
   try {
-    browser = await chromium.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"]
-    });
+    const url = `https://www.cigarsinternational.com/search/?q=${encodeURIComponent(query)}`;
 
-    const page = await browser.newPage();
+    await page.goto(url, { waitUntil: "domcontentloaded" });
 
-    const searchUrl = `https://www.cigarsinternational.com/search?query=${encodeURIComponent(query)}`;
-
-    await page.goto(searchUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 60000
-    });
-
-    // wait for page content to load
-    await page.waitForTimeout(4000);
+    await page.waitForTimeout(3000); // let page fully load
 
     const results = await page.evaluate(() => {
       const items = [];
 
-      const products = document.querySelectorAll(
-        ".product-grid-item, .search-result-item, .product"
-      );
+      const elements = document.querySelectorAll("li, div");
 
-      products.forEach(product => {
+      elements.forEach(el => {
         if (items.length >= 5) return;
 
-        const nameEl =
-          product.querySelector(".product-name") ||
-          product.querySelector(".product-title") ||
-          product.querySelector("a");
+        const text = el.innerText;
 
-        const priceEl =
-          product.querySelector(".price") ||
-          product.querySelector(".product-price") ||
-          product.querySelector(".sales");
+        if (!text || !text.toLowerCase().includes("$")) return;
 
-        const linkEl = product.querySelector("a");
-
-        if (!nameEl || !priceEl || !linkEl) return;
-
-        const name = nameEl.innerText.trim();
-        const priceMatch = priceEl.innerText.match(/\$\d+(\.\d{2})?/);
-
+        const priceMatch = text.match(/\$\d+(\.\d{2})?/);
         if (!priceMatch) return;
+
+        const linkEl = el.querySelector("a");
+        if (!linkEl || !linkEl.href) return;
+
+        const name = text.split("\n")[0];
 
         items.push({
           store: "Cigars International",
-          name,
+          name: name.trim(),
           price: priceMatch[0],
-          url: linkEl.href,
+          url: linkEl.href.startsWith("http")
+            ? linkEl.href
+            : "https://www.cigarsinternational.com" + linkEl.getAttribute("href"),
           pack: "N/A",
           inStock: true,
           lastChecked: new Date().toLocaleString(),
@@ -67,14 +51,13 @@ async function searchCI(query) {
       return items;
     });
 
+    await browser.close();
     return results;
+
   } catch (error) {
-    console.error("CI live search failed:", error.message);
+    console.error("CI Scraper Error:", error.message);
+    await browser.close();
     return [];
-  } finally {
-    if (browser) {
-      await browser.close();
-    }
   }
 }
 
