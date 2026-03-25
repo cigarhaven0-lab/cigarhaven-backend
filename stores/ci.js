@@ -1,5 +1,23 @@
 const { chromium } = require("playwright");
 
+function getCIUrl(query) {
+  const q = query.toLowerCase();
+
+  if (q.includes("padron")) {
+    return "https://www.cigarsinternational.com/shop/padron-cigars/1701404/";
+  }
+
+  if (q.includes("montecristo")) {
+    return "https://www.cigarsinternational.com/shop/montecristo-cigars/1701371/";
+  }
+
+  if (q.includes("arturo") || q.includes("fuente")) {
+    return "https://www.cigarsinternational.com/shop/arturo-fuente-cigars/1701026/";
+  }
+
+  return `https://www.cigarsinternational.com/search/?q=${encodeURIComponent(query)}`;
+}
+
 async function searchCI(query) {
   let browser;
   let page;
@@ -12,9 +30,9 @@ async function searchCI(query) {
 
     page = await browser.newPage();
 
-    const searchUrl = `https://www.cigarsinternational.com/search/?q=${encodeURIComponent(query)}`;
+    const url = getCIUrl(query);
 
-    await page.goto(searchUrl, {
+    await page.goto(url, {
       waitUntil: "domcontentloaded",
       timeout: 60000
     });
@@ -26,7 +44,9 @@ async function searchCI(query) {
       const out = [];
       const seen = new Set();
 
-      const links = Array.from(document.querySelectorAll('a[href*="/p/"]'));
+      const links = Array.from(
+        document.querySelectorAll('a[href*="/p/"], a[href*="/shop/"]')
+      );
 
       for (const link of links) {
         if (out.length >= 8) break;
