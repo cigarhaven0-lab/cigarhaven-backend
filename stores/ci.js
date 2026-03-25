@@ -12,6 +12,7 @@ async function searchCI(query) {
     });
 
     const page = await browser.newPage();
+
     const searchUrl = `https://www.cigarsinternational.com/search?query=${encodeURIComponent(query)}`;
 
     await page.goto(searchUrl, {
@@ -19,45 +20,51 @@ async function searchCI(query) {
       timeout: 60000
     });
 
+    // wait for page content to load
     await page.waitForTimeout(4000);
 
     const results = await page.evaluate(() => {
-      const found = [];
-      const links = Array.from(document.querySelectorAll("a[href]"));
+      const items = [];
 
-      for (const link of links) {
-        const text = (link.innerText || "").trim();
-        const href = link.href || "";
+      const products = document.querySelectorAll(
+        ".product-grid-item, .search-result-item, .product"
+      );
 
-        if (!text || !href) continue;
+      products.forEach(product => {
+        if (items.length >= 5) return;
 
-        const priceMatch = text.match(/\$\d+(\.\d{2})?/);
-        if (!priceMatch) continue;
+        const nameEl =
+          product.querySelector(".product-name") ||
+          product.querySelector(".product-title") ||
+          product.querySelector("a");
 
-        const lines = text
-          .split("\n")
-          .map(x => x.trim())
-          .filter(Boolean);
+        const priceEl =
+          product.querySelector(".price") ||
+          product.querySelector(".product-price") ||
+          product.querySelector(".sales");
 
-        const name = lines.find(line => !line.includes("$")) || text;
+        const linkEl = product.querySelector("a");
 
-        if (!name || name.length < 4) continue;
+        if (!nameEl || !priceEl || !linkEl) return;
 
-        found.push({
+        const name = nameEl.innerText.trim();
+        const priceMatch = priceEl.innerText.match(/\$\d+(\.\d{2})?/);
+
+        if (!priceMatch) return;
+
+        items.push({
           store: "Cigars International",
           name,
           price: priceMatch[0],
-          url: href,
+          url: linkEl.href,
           pack: "N/A",
           inStock: true,
           lastChecked: new Date().toLocaleString(),
           sourceType: "live"
         });
+      });
 
-        if (found.length >= 5) break;
-      }
-
-      return found;
+      return items;
     });
 
     return results;
