@@ -1,4 +1,5 @@
-const { chromium } = require("playwright");
+const axios = require("axios");
+const cheerio = require("cheerio");
 
 function getCIUrl(query) {
   const q = query.toLowerCase();
@@ -19,91 +20,61 @@ function getCIUrl(query) {
 }
 
 async function searchCI(query) {
-  let browser;
-  let page;
-
   try {
-    browser = await chromium.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"]
-    });
-
-    page = await browser.newPage();
-
     const url = getCIUrl(query);
 
-    await page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: 60000
+    const response = await axios.get(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0"
+      },
+      timeout: 30000
     });
 
-    await page.waitForLoadState("networkidle").catch(() => {});
-    await page.waitForTimeout(3000);
+    const $ = cheerio.load(response.data);
+    const results = [];
+    const seen = new Set();
 
-    const results = await page.evaluate(() => {
-      const out = [];
-      const seen = new Set();
+    $('a[href*="/p/"]').each((_, el) => {
+      if (results.length >= 8) return false;
 
-      const links = Array.from(
-        document.querySelectorAll('a[href*="/p/"], a[href*="/shop/"]')
-      );
+      let href = $(el).attr("href");
+      const name = $(el).text().trim();
 
-      for (const link of links) {
-        if (out.length >= 8) break;
+      if (!href || !name || name.length < 4) return;
 
-        const href = link.href;
-        if (!href || seen.has(href)) continue;
-        seen.add(href);
-
-        const container =
-          link.closest("li") ||
-          link.closest("article") ||
-          link.closest("div");
-
-        if (!container) continue;
-
-        const text = (container.innerText || "").trim();
-        if (!text) continue;
-
-        const priceMatch = text.match(/\$\d+(\.\d{2})?/);
-        if (!priceMatch) continue;
-
-        const name =
-          (link.innerText || "").trim() ||
-          text.split("\n").map(x => x.trim()).filter(Boolean)[0];
-
-        if (!name || name.length < 4) continue;
-
-        out.push({
-          store: "Cigars International",
-          name,
-          price: priceMatch[0],
-          url: href,
-          pack: "N/A",
-          inStock: !/out of stock/i.test(text),
-          lastChecked: new Date().toLocaleString(),
-          sourceType: "live"
-        });
+      if (href.startsWith("/")) {
+        href = "https://www.cigarsinternational.com" + href;
       }
 
-      return out;
+      if (seen.has(href)) return;
+      seen.add(href);
+
+      const container =
+        $(el).closest("li, article, div");
+
+      const text = container.text().replace(/\s+/g, " ").trim();
+      const priceMatch = text.match(/(?:As low as )?\$(\d+(?:\.\d{2})?)/i);
+
+      if (!priceMatch) return;
+
+      const price = `$${priceMatch[1]}`;
+
+      results.push({
+        store: "Cigars International",
+        name,
+        price,
+        url: href,
+        pack: "N/A",
+        inStock: !/out of stock/i.test(text),
+        lastChecked: new Date().toLocaleString(),
+        sourceType: "live"
+      });
     });
 
-    return Array.isArray(results) ? results : [];
+    return results;
   } catch (error) {
     console.error("CI scraper failed:", error.message);
     return [];
-  } finally {
-    if (page) {
-      try {
-        await page.close();
-      } catch {}
-    }
-    if (browser) {
-      try {
-        await browser.close();
-      } catch {}
-    }
   }
 }
 
