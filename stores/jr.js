@@ -1,16 +1,22 @@
+const products = require("../data/jr-products.json");
+
 async function searchJR(query) {
-  return [
-    {
+  const search = query.toLowerCase();
+
+  const matches = products
+    .filter(product => product.name.toLowerCase().includes(search))
+    .map(product => ({
       store: "JR Cigars",
-      name: `${query} (sample result)`,
-      price: "$12.99",
-      url: "https://www.jrcigars.com/",
-      pack: "Single",
-      inStock: true,
+      name: product.name,
+      price: product.price,
+      url: product.url,
+      pack: product.pack,
+      inStock: product.inStock,
       lastChecked: new Date().toLocaleString(),
-      sourceType: "sample"
-    }
-  ];
+      sourceType: "dataset"
+    }));
+
+  return matches;
 }
 
 module.exports = searchJR;
