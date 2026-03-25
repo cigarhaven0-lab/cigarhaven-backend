@@ -22,18 +22,22 @@ app.get("/search", async (req, res) => {
   }
 
   try {
-    const resultsArrays = await Promise.all(
+    const settled = await Promise.allSettled(
       stores.map(storeSearch => storeSearch(query))
     );
 
-    const results = resultsArrays.flat().sort((a, b) => {
-  const priceA = parseFloat(a.price.replace("$", ""));
-  const priceB = parseFloat(b.price.replace("$", ""));
-  return priceA - priceB;
-});
+    const results = settled
+      .filter(result => result.status === "fulfilled" && Array.isArray(result.value))
+      .flatMap(result => result.value)
+      .sort((a, b) => {
+        const priceA = parseFloat(String(a.price || "").replace("$", "")) || 999999;
+        const priceB = parseFloat(String(b.price || "").replace("$", "")) || 999999;
+        return priceA - priceB;
+      });
+
     res.json(results);
   } catch (error) {
-    console.error("Search failed:", error.message);
+    console.error("Search route failed:", error.message);
     res.status(500).json({ error: "Search failed" });
   }
 });
