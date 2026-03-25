@@ -1,5 +1,4 @@
-const axios = require("axios");
-const cheerio = require("cheerio");
+const { chromium } = require("playwright");
 
 function getCIUrl(query) {
   const q = query.toLowerCase();
@@ -19,62 +18,139 @@ function getCIUrl(query) {
   return `https://www.cigarsinternational.com/search/?q=${encodeURIComponent(query)}`;
 }
 
-async function searchCI(query) {
-  try {
-    const url = getCIUrl(query);
+function normalizeText(str) {
+  return String(str || "")
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
-    const response = await axios.get(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0"
-      },
-      timeout: 30000
+function queryTerms(query) {
+  const q = query.toLowerCase();
+  if (q.includes("arturo") || q.includes("fuente")) {
+    return ["arturo", "fuente"];
+  }
+  return q.split(/\s+/).filter(Boolean);
+}
+
+function isUsefulAnchor(text, href, terms) {
+  const t = text.toLowerCase();
+
+  if (!href) return false;
+  if (!href.includes("/p/")) return false;
+  if (text.length < 4) return false;
+
+  const bad = [
+    "shop now",
+    "login",
+    "register",
+    "my account",
+    "cart",
+    "help",
+    "request a catalog",
+    "receive email specials"
+  ];
+
+  if (bad.includes(t)) return false;
+
+  return terms.some(term => t.includes(term));
+}
+
+async function searchCI(query) {
+  let browser;
+  let page;
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox"]
     });
 
-    const $ = cheerio.load(response.data);
+    page = await browser.newPage();
+
+    const url = getCIUrl(query);
+
+    await page.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: 60000
+    });
+
+    await page.waitForLoadState("networkidle").catch(() => {});
+    await page.waitForTimeout(3000);
+
+    const scraped = await page.evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll("a[href]")).map(a => ({
+        text: (a.innerText || a.textContent || "").trim(),
+        href: a.href || ""
+      }));
+
+      return {
+        title: document.title || "",
+        finalUrl: location.href,
+        bodyText: document.body ? document.body.innerText || "" : "",
+        anchors
+      };
+    });
+
+    const terms = queryTerms(query);
+    const lines = scraped.bodyText
+      .split("\n")
+      .map(normalizeText)
+      .filter(Boolean);
+
+    const anchors = scraped.anchors
+      .map(a => ({
+        text: normalizeText(a.text),
+        href: a.href
+      }))
+      .filter(a => isUsefulAnchor(a.text, a.href, terms));
+
+    const seenHref = new Set();
     const results = [];
-    const seen = new Set();
 
-    $('a[href*="/p/"]').each((_, el) => {
-      if (results.length >= 8) return false;
+    for (const anchor of anchors) {
+      if (results.length >= 8) break;
+      if (seenHref.has(anchor.href)) continue;
+      seenHref.add(anchor.href);
 
-      let href = $(el).attr("href");
-      const name = $(el).text().trim();
+      const idx = lines.findIndex(line => line === anchor.text || line.includes(anchor.text));
 
-      if (!href || !name || name.length < 4) return;
+      if (idx === -1) continue;
 
-      if (href.startsWith("/")) {
-        href = "https://www.cigarsinternational.com" + href;
-      }
+      const windowText = lines.slice(idx, idx + 12).join(" ");
+      const priceMatch = windowText.match(/(?:As low as )?\$(\d+(?:\.\d{2})?)/i);
 
-      if (seen.has(href)) return;
-      seen.add(href);
+      if (!priceMatch) continue;
 
-      const container =
-        $(el).closest("li, article, div");
-
-      const text = container.text().replace(/\s+/g, " ").trim();
-      const priceMatch = text.match(/(?:As low as )?\$(\d+(?:\.\d{2})?)/i);
-
-      if (!priceMatch) return;
-
-      const price = `$${priceMatch[1]}`;
+      const textAround = lines.slice(idx, idx + 12).join(" ").toLowerCase();
 
       results.push({
         store: "Cigars International",
-        name,
-        price,
-        url: href,
+        name: anchor.text,
+        price: `$${priceMatch[1]}`,
+        url: anchor.href,
         pack: "N/A",
-        inStock: !/out of stock/i.test(text),
+        inStock: !textAround.includes("out of stock"),
         lastChecked: new Date().toLocaleString(),
         sourceType: "live"
       });
-    });
+    }
 
     return results;
   } catch (error) {
     console.error("CI scraper failed:", error.message);
     return [];
+  } finally {
+    if (page) {
+      try {
+        await page.close();
+      } catch {}
+    }
+    if (browser) {
+      try {
+        await browser.close();
+      } catch {}
+    }
   }
 }
 
