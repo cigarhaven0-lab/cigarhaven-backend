@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: cigarhaven-backend
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: BROWSERLESS_TOKEN
+        sync: false
