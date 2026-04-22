@@ -1,0 +1,37 @@
+[
+  {
+    "name": "Padron 1964 Anniversary Exclusivo",
+    "price": "$15.99",
+    "url": "https://www.jrcigars.com/",
+    "pack": "Single",
+    "inStock": true
+  },
+  {
+    "name": "Padron 2000 Natural",
+    "price": "$9.49",
+    "url": "https://www.jrcigars.com/",
+    "pack": "Single",
+    "inStock": true
+  },
+  {
+    "name": "Padron 3000 Maduro",
+    "price": "$10.99",
+    "url": "https://www.jrcigars.com/",
+    "pack": "Single",
+    "inStock": false
+  },
+  {
+    "name": "Montecristo White Toro",
+    "price": "$12.49",
+    "url": "https://www.jrcigars.com/",
+    "pack": "5-Pack",
+    "inStock": true
+  },
+  {
+    "name": "Arturo Fuente Chateau Fuente",
+    "price": "$8.99",
+    "url": "https://www.jrcigars.com/",
+    "pack": "Single",
+    "inStock": true
+  }
+]
