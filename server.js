@@ -1,0 +1,232 @@
+/**
+ * Cigar Haven Backend — Gemini + Google Search grounding.
+ *
+ * Searches the open web for cigar prices across ANY reputable online retailer,
+ * not a fixed list. Returns deterministic results (temperature: 0) sorted by
+ * price.
+ *
+ * Required env: GEMINI_API_KEY  (free key from https://aistudio.google.com)
+ * Optional env: GEMINI_MODEL    (default: gemini-2.5-flash)
+ */
+
+const express = require("express");
+const cors = require("cors");
+
+const genaiMod = require("@google/genai");
+const GoogleGenAI = genaiMod.GoogleGenAI || genaiMod.default || genaiMod;
+
+const app = express();
+app.use(cors());
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+
+const SYSTEM_PROMPT = `You are the search backend for "Cigar Haven", a cigar price comparison site that finds the best online prices for cigars across the open web.
+
+YOUR JOB
+Given a cigar brand or product query, search the open web for current online retail listings and return them as JSON. You are NOT limited to a fixed list of retailers — search broadly and surface the best prices wherever they exist.
+
+SEARCH STRATEGY
+Run multiple Google searches to get good coverage:
+  1. "<query> cigars price"
+  2. "<query> cigars online buy"
+  3. "<query> cigars cheapest"
+  4. Optionally narrow by specific large retailers if it helps:
+       site:jrcigars.com, site:thompsoncigar.com, site:cigarsinternational.com,
+       site:famous-smoke.com, site:holts.com, site:smallbatchcigar.com,
+       site:cigarpage.com, site:atlanticcigar.com, site:bestcigarprices.com, etc.
+
+Aim to surface 10-25 listings total across as many distinct retailers as you can find. Variety of retailers matters more than depth at one retailer — the goal is best-price comparison.
+
+OUTPUT FORMAT
+Your final response MUST be ONLY a JSON array — no prose, no preamble, no markdown code fences, no commentary. The first character must be '[' and the last must be ']'.
+
+Each item in the array MUST have this exact shape:
+{
+  "store": "<human-readable retailer name, e.g. 'JR Cigars', 'Famous Smoke Shop', 'Holt's Cigar Company'>",
+  "name": "<full product name as listed>",
+  "price": "$<number>",
+  "url": "<full https URL of the actual product page>",
+  "pack": "<e.g. 'Box of 20', 'Single', 'Bundle of 25', '5 Pack', or 'N/A'>",
+  "inStock": true | false
+}
+
+HARD RULES
+- Output JSON ONLY. No prose before or after. No code fences.
+- Only include listings you actually found via Google Search. Never invent products, prices, or URLs.
+- "store" should be the human-readable retailer name, derived from the page title or the domain (e.g. jrcigars.com → "JR Cigars", famous-smoke.com → "Famous Smoke Shop").
+- "price" must start with "$" followed by a number (e.g. "$24.99", "$189").
+- "url" must be a real product URL on the retailer's domain — not a category page, search results page, or aggregator/comparison site.
+- Skip auction sites (eBay listings vary), marketplaces (Amazon, Walmart unless they're the retailer), and review/news articles.
+- Set "inStock" to false ONLY if the listing explicitly says "out of stock" or "sold out". Otherwise true.`;
+
+async function searchWithGemini(query) {
+  const userMessage =
+    `Find current online cigar listings for: "${query}"\n\n` +
+    `Search the open web. Surface 10-25 listings across as many distinct ` +
+    `retailers as you can. Return the JSON array exactly as specified — your ` +
+    `entire response must be the JSON array, nothing else.`;
+
+  const response = await ai.models.generateContent({
+    model: MODEL,
+    contents: userMessage,
+    config: {
+      systemInstruction: SYSTEM_PROMPT,
+      tools: [{ googleSearch: {} }],
+      // Pinned to 0 for deterministic output across runs
+      temperature: 0,
+    },
+  });
+
+  let rawText = "";
+  try {
+    rawText = (response.text || "").trim();
+  } catch (_) {
+    rawText = "";
+  }
+  if (!rawText) {
+    const parts = response?.candidates?.[0]?.content?.parts || [];
+    rawText = parts.map((p) => p.text || "").join("").trim();
+  }
+
+  const items = parseJsonArray(rawText);
+
+  const now = new Date().toLocaleString();
+  const cleaned = items.filter(isValidItem).map((it) => ({
+    store: String(it.store).trim(),
+    name: String(it.name).trim(),
+    price: String(it.price).trim(),
+    url: String(it.url).trim(),
+    pack: it.pack ? String(it.pack).trim() : "N/A",
+    inStock: it.inStock !== false,
+    lastChecked: now,
+    sourceType: "ai",
+  }));
+
+  const groundingMeta = response?.candidates?.[0]?.groundingMetadata || null;
+  const searchQueries = groundingMeta?.webSearchQueries || [];
+  const sources = (groundingMeta?.groundingChunks || [])
+    .map((c) => c?.web?.title)
+    .filter(Boolean);
+
+  return {
+    results: cleaned,
+    debug: {
+      rawText,
+      model: MODEL,
+      itemCountRaw: items.length,
+      itemCountClean: cleaned.length,
+      searchQueries,
+      sources,
+      usage: response?.usageMetadata || null,
+    },
+  };
+}
+
+function parseJsonArray(text) {
+  if (!text) return [];
+
+  let s = text.replace(/```(?:json)?\s*/gi, "").replace(/```/g, "").trim();
+
+  const start = s.indexOf("[");
+  const end = s.lastIndexOf("]");
+  if (start !== -1 && end !== -1 && end > start) {
+    try {
+      const parsed = JSON.parse(s.slice(start, end + 1));
+      if (Array.isArray(parsed)) return parsed;
+    } catch (_) {}
+  }
+
+  const objects = [];
+  const matches = s.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g) || [];
+  for (const m of matches) {
+    try {
+      objects.push(JSON.parse(m));
+    } catch (_) {}
+  }
+  return objects;
+}
+
+// Light sanity check: required fields, price format, real http(s) URL.
+// No domain whitelist — Gemini can return any retailer.
+function isValidItem(it) {
+  if (!it || typeof it !== "object") return false;
+  if (!it.store || !it.name || !it.price || !it.url) return false;
+  if (typeof it.price !== "string" || !it.price.includes("$")) return false;
+  if (typeof it.url !== "string" || !/^https?:\/\/[^\s]+\.[^\s]+/i.test(it.url)) return false;
+  return true;
+}
+
+function sortByPrice(arr) {
+  return [...arr].sort((a, b) => {
+    const pa = parseFloat(String(a.price || "").replace(/[^0-9.]/g, "")) || 999999;
+    const pb = parseFloat(String(b.price || "").replace(/[^0-9.]/g, "")) || 999999;
+    return pa - pb;
+  });
+}
+
+// ---------- routes ----------
+
+app.get("/", (req, res) => {
+  res.send("Cigar Haven Backend running ✅ (Gemini + open web search)");
+});
+
+app.get("/search", async (req, res) => {
+  const query = (req.query.q || "").toString().trim();
+  if (!query) return res.json({ error: "No search query provided" });
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(500).json({ error: "GEMINI_API_KEY not set on the server" });
+  }
+
+  console.log(`[search] query: "${query}" model=${MODEL}`);
+  try {
+    const { results, debug } = await searchWithGemini(query);
+    const sorted = sortByPrice(results);
+    const byStore = sorted.reduce((acc, r) => ((acc[r.store] = (acc[r.store] || 0) + 1), acc), {});
+    console.log(
+      `[search] returned ${sorted.length} results ` +
+        `(raw ${debug.itemCountRaw}, searches=${debug.searchQueries.length}) ` +
+        `byStore=${JSON.stringify(byStore)}`
+    );
+    res.json(sorted);
+  } catch (err) {
+    console.error("[search] failed:", err.message);
+    res.status(500).json({ error: err.message || "Search failed" });
+  }
+});
+
+app.get("/debug", async (req, res) => {
+  const query = (req.query.q || "padron").toString().trim();
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(500).json({ error: "GEMINI_API_KEY not set on the server" });
+  }
+
+  console.log(`[debug] query: "${query}"`);
+  try {
+    const { results, debug } = await searchWithGemini(query);
+    const byStore = results.reduce((acc, r) => ((acc[r.store] = (acc[r.store] || 0) + 1), acc), {});
+    res.json({
+      query,
+      model: debug.model,
+      itemCountRaw: debug.itemCountRaw,
+      itemCountClean: debug.itemCountClean,
+      byStore,
+      searchQueries: debug.searchQueries,
+      sources: debug.sources,
+      usage: debug.usage,
+      rawText: debug.rawText,
+      results: sortByPrice(results),
+    });
+  } catch (err) {
+    console.error("[debug] failed:", err.message);
+    res.status(500).json({ query, error: err.message });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Cigar Haven Backend listening on port ${PORT} — model=${MODEL}`);
+  if (!process.env.GEMINI_API_KEY) {
+    console.warn("⚠️  GEMINI_API_KEY is not set — /search and /debug will fail until you set it.");
+  }
+});
