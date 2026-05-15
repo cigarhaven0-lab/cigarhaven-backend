@@ -92,7 +92,7 @@ async function searchWithGemini(query) {
   const items = parseJsonArray(rawText);
 
   const now = new Date().toLocaleString();
-  const cleaned = items.filter(isValidItem).map((it) => ({
+  const prelim = items.filter(isValidItem).map((it) => ({
     store: String(it.store).trim(),
     name: String(it.name).trim(),
     price: String(it.price).trim(),
@@ -102,6 +102,15 @@ async function searchWithGemini(query) {
     lastChecked: now,
     sourceType: "ai",
   }));
+
+  // Verify each URL actually resolves. LLMs sometimes hallucinate plausible
+  // product URLs that 404. We drop items whose URL doesn't return a
+  // successful response so users never see a broken link.
+  const verifications = await Promise.all(
+    prelim.map(async (it) => ({ item: it, ok: await verifyUrl(it.url) }))
+  );
+  const cleaned = verifications.filter((v) => v.ok).map((v) => v.item);
+  const droppedUrls = verifications.filter((v) => !v.ok).map((v) => v.item.url);
 
   const groundingMeta = response?.candidates?.[0]?.groundingMetadata || null;
   const searchQueries = groundingMeta?.webSearchQueries || [];
@@ -119,8 +128,49 @@ async function searchWithGemini(query) {
       searchQueries,
       sources,
       usage: response?.usageMetadata || null,
+      droppedUrls,
     },
   };
+}
+
+// Verify a URL resolves to a non-error response. Tries HEAD first (cheap),
+// falls back to a ranged GET because some retailers reject or mis-handle HEAD.
+// Follows redirects and uses a browser-like User-Agent so bot filters don't
+// produce false negatives. Any 2xx/3xx counts as good.
+async function verifyUrl(url) {
+  if (!url || typeof url !== "string") return false;
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Accept":
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif," +
+      "image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+  };
+
+  async function attempt(method, extraHeaders) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const resp = await fetch(url, {
+        method,
+        redirect: "follow",
+        headers: { ...headers, ...(extraHeaders || {}) },
+        signal: ctrl.signal,
+      });
+      return resp.status >= 200 && resp.status < 400;
+    } catch (_) {
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  if (await attempt("HEAD")) return true;
+  // Some sites return 403/405 on HEAD but 200 on GET — retry with a tiny
+  // range so we don't actually download the whole page.
+  return attempt("GET", { Range: "bytes=0-1024" });
 }
 
 function parseJsonArray(text) {
@@ -185,7 +235,8 @@ app.get("/search", async (req, res) => {
     const byStore = sorted.reduce((acc, r) => ((acc[r.store] = (acc[r.store] || 0) + 1), acc), {});
     console.log(
       `[search] returned ${sorted.length} results ` +
-        `(raw ${debug.itemCountRaw}, searches=${debug.searchQueries.length}) ` +
+        `(raw ${debug.itemCountRaw}, droppedBrokenUrls=${debug.droppedUrls.length}, ` +
+        `searches=${debug.searchQueries.length}) ` +
         `byStore=${JSON.stringify(byStore)}`
     );
     res.json(sorted);
@@ -214,6 +265,7 @@ app.get("/debug", async (req, res) => {
       searchQueries: debug.searchQueries,
       sources: debug.sources,
       usage: debug.usage,
+      droppedUrls: debug.droppedUrls,
       rawText: debug.rawText,
       results: sortByPrice(results),
     });
