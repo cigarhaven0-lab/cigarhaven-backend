@@ -134,10 +134,14 @@ async function searchWithGemini(query) {
   };
 }
 
-// Verify a URL resolves to a non-error response. Tries HEAD first (cheap),
-// falls back to a ranged GET because some retailers reject or mis-handle HEAD.
-// Follows redirects and uses a browser-like User-Agent so bot filters don't
-// produce false negatives. Any 2xx/3xx counts as good.
+// Verify a URL points to a real product page. Many retailers serve "soft
+// 404" pages — HTTP 200 with a "Page Not Found" body — for missing
+// products, so a status-only check lets broken links through to users.
+// This GETs the first 64KB, follows redirects with a browser-like
+// User-Agent, then rejects if:
+//   - status is 4xx/5xx
+//   - the final URL path looks like /404, /not-found, etc.
+//   - <title> or <h1> contains "page not found" / "404 error" markers
 async function verifyUrl(url) {
   if (!url || typeof url !== "string") return false;
   const headers = {
@@ -148,30 +152,75 @@ async function verifyUrl(url) {
       "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif," +
       "image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Range": "bytes=0-65535",
   };
 
-  async function attempt(method, extraHeaders) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 8000);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const resp = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      headers,
+      signal: ctrl.signal,
+    });
+
+    if (resp.status < 200 || resp.status >= 400) return false;
+    if (looksLikeNotFoundUrl(resp.url || url)) return false;
+
+    let body = "";
     try {
-      const resp = await fetch(url, {
-        method,
-        redirect: "follow",
-        headers: { ...headers, ...(extraHeaders || {}) },
-        signal: ctrl.signal,
-      });
-      return resp.status >= 200 && resp.status < 400;
+      body = await resp.text();
     } catch (_) {
-      return false;
-    } finally {
-      clearTimeout(timer);
+      // Status was OK but body couldn't be read — accept rather than
+      // drop a potentially good listing.
+      return true;
     }
+    return !looksLikeNotFoundBody(body);
+  } catch (_) {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function looksLikeNotFoundUrl(url) {
+  try {
+    const pathname = new URL(url).pathname.toLowerCase();
+    return /(?:^|\/)(?:404|not[-_]?found|page[-_]?not[-_]?found|error[-_]?(?:404|page))(?:\/|\.html?|$)/.test(
+      pathname
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
+// Soft-404 detection: looks for "page not found" markers in <title> and
+// <h1>. These phrases on a real cigar product page would be very
+// surprising, so they're a strong signal the URL is dead even when the
+// server returned HTTP 200.
+const NOT_FOUND_RE =
+  /page\s+not\s+found|404\s+not\s+found|not\s+found\s*[-—|:]\s*404|404\s+error|error\s+404|404\s*[-—|:]\s*(?:not\s+found|error|page)|page\s+(?:doesn'?t|does\s+not)\s+exist|we\s+(?:can'?t|cannot|couldn'?t)\s+find\s+(?:that|the|this)|sorry,?\s+(?:we\s+)?(?:can'?t|couldn'?t)\s+find|the\s+page\s+you'?re\s+looking\s+for|product\s+(?:is\s+)?no\s+longer\s+available|this\s+page\s+(?:is\s+)?(?:no\s+longer\s+)?(?:available|unavailable)/i;
+
+function looksLikeNotFoundBody(body) {
+  if (!body || typeof body !== "string") return false;
+
+  const titleMatch = body.match(/<title[^>]*>([\s\S]{0,300}?)<\/title>/i);
+  if (titleMatch) {
+    const title = titleMatch[1].replace(/<[^>]+>/g, " ").trim();
+    if (NOT_FOUND_RE.test(title)) return true;
+    // Whole-title matches like "404", "Not Found", "404 Not Found".
+    if (/^(?:404|not\s+found|404\s*[-—|:]?\s*not\s+found)\s*$/i.test(title)) return true;
   }
 
-  if (await attempt("HEAD")) return true;
-  // Some sites return 403/405 on HEAD but 200 on GET — retry with a tiny
-  // range so we don't actually download the whole page.
-  return attempt("GET", { Range: "bytes=0-1024" });
+  const h1Match = body.match(/<h1\b[^>]*>([\s\S]{0,500}?)<\/h1>/i);
+  if (h1Match) {
+    const h1 = h1Match[1].replace(/<[^>]+>/g, " ").trim();
+    if (NOT_FOUND_RE.test(h1)) return true;
+    if (/^(?:404|not\s+found|oops!?)\s*$/i.test(h1)) return true;
+  }
+
+  return false;
 }
 
 function parseJsonArray(text) {
