@@ -56,7 +56,8 @@ HARD RULES
 - Only include listings you actually found via Google Search. Never invent products, prices, or URLs.
 - "store" should be the human-readable retailer name, derived from the page title or the domain (e.g. jrcigars.com → "JR Cigars", famous-smoke.com → "Famous Smoke Shop").
 - "price" must start with "$" followed by a number (e.g. "$24.99", "$189").
-- "url" must be a real product URL on the retailer's domain — not a category page, search results page, or aggregator/comparison site.
+- "url" MUST be copied character-for-character from the actual Google Search result URL. Do NOT construct, guess, shorten, or modify URLs in any way. If you do not have an exact confirmed product page URL from your search results, omit that listing entirely — a missing listing is better than a broken link.
+- "url" must point to a specific product page on the retailer's domain — not a category page, search results page, or aggregator/comparison site.
 - Skip auction sites (eBay listings vary), marketplaces (Amazon, Walmart unless they're the retailer), and review/news articles.
 - Set "inStock" to false ONLY if the listing explicitly says "out of stock" or "sold out". Otherwise true.`;
 
@@ -92,7 +93,7 @@ async function searchWithGemini(query) {
   const items = parseJsonArray(rawText);
 
   const now = new Date().toLocaleString();
-  const cleaned = items.filter(isValidItem).map((it) => ({
+  const prelim = items.filter(isValidItem).map((it) => ({
     store: String(it.store).trim(),
     name: String(it.name).trim(),
     price: String(it.price).trim(),
@@ -102,6 +103,15 @@ async function searchWithGemini(query) {
     lastChecked: now,
     sourceType: "ai",
   }));
+
+  // Verify each URL actually resolves. Gemini sometimes constructs plausible
+  // product URLs that 404. Drop items whose URL doesn't return a successful
+  // response so users never see a broken link.
+  const verifications = await Promise.all(
+    prelim.map(async (it) => ({ item: it, ok: await verifyUrl(it.url) }))
+  );
+  const cleaned = verifications.filter((v) => v.ok).map((v) => v.item);
+  const droppedUrls = verifications.filter((v) => !v.ok).map((v) => v.item.url);
 
   const groundingMeta = response?.candidates?.[0]?.groundingMetadata || null;
   const searchQueries = groundingMeta?.webSearchQueries || [];
@@ -119,8 +129,49 @@ async function searchWithGemini(query) {
       searchQueries,
       sources,
       usage: response?.usageMetadata || null,
+      droppedUrls,
     },
   };
+}
+
+// Verify a URL resolves to a non-error response. Tries HEAD first (cheap),
+// falls back to a ranged GET because some retailers reject or mis-handle HEAD.
+// Follows redirects and uses a browser-like User-Agent so bot filters don't
+// produce false negatives. Any 2xx/3xx counts as good.
+async function verifyUrl(url) {
+  if (!url || typeof url !== "string") return false;
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Accept":
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif," +
+      "image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+  };
+
+  async function attempt(method, extraHeaders) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const resp = await fetch(url, {
+        method,
+        redirect: "follow",
+        headers: { ...headers, ...(extraHeaders || {}) },
+        signal: ctrl.signal,
+      });
+      return resp.status >= 200 && resp.status < 400;
+    } catch (_) {
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  if (await attempt("HEAD")) return true;
+  // Some sites return 403/405 on HEAD but 200 on GET — retry with a tiny
+  // range so we don't actually download the whole page.
+  return attempt("GET", { Range: "bytes=0-1024" });
 }
 
 function parseJsonArray(text) {
@@ -185,7 +236,8 @@ app.get("/search", async (req, res) => {
     const byStore = sorted.reduce((acc, r) => ((acc[r.store] = (acc[r.store] || 0) + 1), acc), {});
     console.log(
       `[search] returned ${sorted.length} results ` +
-        `(raw ${debug.itemCountRaw}, searches=${debug.searchQueries.length}) ` +
+        `(raw ${debug.itemCountRaw}, droppedBrokenUrls=${debug.droppedUrls.length}, ` +
+        `searches=${debug.searchQueries.length}) ` +
         `byStore=${JSON.stringify(byStore)}`
     );
     res.json(sorted);
@@ -214,6 +266,7 @@ app.get("/debug", async (req, res) => {
       searchQueries: debug.searchQueries,
       sources: debug.sources,
       usage: debug.usage,
+      droppedUrls: debug.droppedUrls,
       rawText: debug.rawText,
       results: sortByPrice(results),
     });
