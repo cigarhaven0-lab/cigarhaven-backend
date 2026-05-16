@@ -61,12 +61,24 @@ HARD RULES
 - Skip auction sites (eBay listings vary), marketplaces (Amazon, Walmart unless they're the retailer), and review/news articles.
 - Set "inStock" to false ONLY if the listing explicitly says "out of stock" or "sold out". Otherwise true.`;
 
-async function searchWithGemini(query) {
-  const userMessage =
+async function searchWithGemini(query, opts = {}) {
+  const excludeDomains = Array.isArray(opts.excludeDomains) ? opts.excludeDomains : [];
+
+  const baseMessage =
     `Find current online cigar listings for: "${query}"\n\n` +
     `Search the open web. Surface 10-25 listings across as many distinct ` +
     `retailers as you can. Return the JSON array exactly as specified — your ` +
     `entire response must be the JSON array, nothing else.`;
+
+  const userMessage = excludeDomains.length
+    ? baseMessage +
+      `\n\nWe already have listings from these retailers:\n` +
+      excludeDomains.map((d) => `- ${d}`).join("\n") +
+      `\n\nPlease prioritize finding listings from OTHER retailers we ` +
+      `haven't covered yet — smaller specialty cigar shops, regional ` +
+      `retailers, boutique online stores, etc. Cast a wide net. If the ` +
+      `same product appears on a new retailer at a different price, include it.`
+    : baseMessage;
 
   const response = await ai.models.generateContent({
     model: MODEL,
@@ -132,6 +144,87 @@ async function searchWithGemini(query) {
       droppedUrls,
     },
   };
+}
+
+// Run two Gemini passes back-to-back to maximize retailer coverage. Pass 1
+// does a broad search. Pass 2 is told which domains pass 1 already covered
+// and is asked to focus on OTHER retailers (specialty / regional / boutique
+// shops Gemini might otherwise skip). Results are merged and deduped by
+// canonical URL so a retailer appearing in both passes only shows up once.
+async function searchTwoPasses(query) {
+  const pass1 = await searchWithGemini(query);
+
+  const seenDomains = uniqueDomains(pass1.results);
+  const pass2 = await searchWithGemini(query, { excludeDomains: seenDomains });
+
+  const merged = dedupeByUrl([...pass1.results, ...pass2.results]);
+
+  const pass1Keys = new Set(pass1.results.map((it) => canonicalUrlKey(it.url)));
+  const newInPass2 = pass2.results.filter(
+    (it) => !pass1Keys.has(canonicalUrlKey(it.url))
+  ).length;
+
+  return {
+    results: merged,
+    debug: {
+      model: pass1.debug.model,
+      itemCountRaw: pass1.debug.itemCountRaw + pass2.debug.itemCountRaw,
+      itemCountClean: merged.length,
+      itemCountFromPass1: pass1.results.length,
+      itemCountFromPass2: pass2.results.length,
+      itemCountNewInPass2: newInPass2,
+      pass1Domains: seenDomains,
+      pass2Domains: uniqueDomains(pass2.results),
+      searchQueries: [
+        ...(pass1.debug.searchQueries || []),
+        ...(pass2.debug.searchQueries || []),
+      ],
+      sources: [
+        ...(pass1.debug.sources || []),
+        ...(pass2.debug.sources || []),
+      ],
+      usage: { pass1: pass1.debug.usage, pass2: pass2.debug.usage },
+      droppedUrls: [
+        ...(pass1.debug.droppedUrls || []),
+        ...(pass2.debug.droppedUrls || []),
+      ],
+      rawText: `--- PASS 1 ---\n${pass1.debug.rawText}\n\n--- PASS 2 ---\n${pass2.debug.rawText}`,
+    },
+  };
+}
+
+function canonicalUrlKey(url) {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase().replace(/^www\./, "");
+    const path = u.pathname.replace(/\/+$/, "");
+    return (u.protocol + "//" + host + path + u.search).toLowerCase();
+  } catch (_) {
+    return String(url || "").toLowerCase();
+  }
+}
+
+function dedupeByUrl(items) {
+  const seen = new Set();
+  const out = [];
+  for (const it of items) {
+    const key = canonicalUrlKey(it.url);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(it);
+  }
+  return out;
+}
+
+function uniqueDomains(items) {
+  const set = new Set();
+  for (const it of items) {
+    try {
+      const host = new URL(it.url).hostname.toLowerCase().replace(/^www\./, "");
+      if (host) set.add(host);
+    } catch (_) {}
+  }
+  return [...set];
 }
 
 // Verify a URL points to a real product page. Many retailers serve "soft
@@ -280,12 +373,14 @@ app.get("/search", async (req, res) => {
 
   console.log(`[search] query: "${query}" model=${MODEL}`);
   try {
-    const { results, debug } = await searchWithGemini(query);
+    const { results, debug } = await searchTwoPasses(query);
     const sorted = sortByPrice(results);
     const byStore = sorted.reduce((acc, r) => ((acc[r.store] = (acc[r.store] || 0) + 1), acc), {});
     console.log(
       `[search] returned ${sorted.length} results ` +
-        `(raw ${debug.itemCountRaw}, droppedBrokenUrls=${debug.droppedUrls.length}, ` +
+        `(pass1=${debug.itemCountFromPass1}, pass2=${debug.itemCountFromPass2}, ` +
+        `newInPass2=${debug.itemCountNewInPass2}, ` +
+        `droppedBrokenUrls=${debug.droppedUrls.length}, ` +
         `searches=${debug.searchQueries.length}) ` +
         `byStore=${JSON.stringify(byStore)}`
     );
@@ -304,13 +399,18 @@ app.get("/debug", async (req, res) => {
 
   console.log(`[debug] query: "${query}"`);
   try {
-    const { results, debug } = await searchWithGemini(query);
+    const { results, debug } = await searchTwoPasses(query);
     const byStore = results.reduce((acc, r) => ((acc[r.store] = (acc[r.store] || 0) + 1), acc), {});
     res.json({
       query,
       model: debug.model,
       itemCountRaw: debug.itemCountRaw,
       itemCountClean: debug.itemCountClean,
+      itemCountFromPass1: debug.itemCountFromPass1,
+      itemCountFromPass2: debug.itemCountFromPass2,
+      itemCountNewInPass2: debug.itemCountNewInPass2,
+      pass1Domains: debug.pass1Domains,
+      pass2Domains: debug.pass2Domains,
       byStore,
       searchQueries: debug.searchQueries,
       sources: debug.sources,
