@@ -84,33 +84,54 @@ Every "url" MUST go directly to ONE specific cigar product page where a user can
 A valid product URL almost always contains the specific cigar's identifying details — vitola/size (e.g. "no-4", "robusto", "toro"), wrapper (e.g. "maduro", "natural"), and/or pack count (e.g. "5-pack", "box-of-20"), or a unique numeric/SKU product ID. If your URL doesn't pin down a specific cigar SKU, OMIT that listing.`;
 
 async function searchWithGemini(query, opts = {}) {
+  const mode = opts.mode || "broad";
   const excludeDomains = Array.isArray(opts.excludeDomains) ? opts.excludeDomains : [];
 
-  const baseMessage =
-    `Find current online cigar listings for: "${query}"\n\n` +
-    `Search the open web. Surface 20-40 listings across as many distinct ` +
-    `retailers as you can — variety matters. Return the JSON array exactly ` +
-    `as specified — your entire response must be the JSON array, nothing else.\n\n` +
+  const reminder =
     `Reminder: every URL must go to a SPECIFIC cigar product page, not a ` +
     `brand/category landing page. If you only have a brand URL, skip that listing.`;
 
-  const userMessage = excludeDomains.length
-    ? baseMessage +
-      `\n\nWe already have listings from these retailers, so DO NOT return ` +
+  let userMessage;
+  if (mode === "specialty") {
+    userMessage =
+      `Find current online cigar listings for: "${query}"\n\n` +
+      `Focus this entire search on SPECIALTY / BOUTIQUE / REGIONAL cigar ` +
+      `shops — NOT the major chains. Specifically avoid returning results ` +
+      `from these big-chain domains:\n` +
+      `  - jrcigars.com\n  - famous-smoke.com\n  - cigarsinternational.com\n` +
+      `  - holts.com\n  - thompsoncigar.com\n  - cigar.com\n\n` +
+      `Try retailers like (and similar):\n` +
+      `  - smallbatchcigar.com\n  - mikescigars.com\n  - neptunecigar.com\n` +
+      `  - cigarpage.com\n  - corona-cigar.com\n  - cigarsdirect.com\n` +
+      `  - atlanticcigar.com\n  - bestcigarprices.com\n  - cuencacigars.com\n` +
+      `  - watchcigar.com\n  - cigarpost.com\n  - bonita-smoke.com\n` +
+      `  - Regional cigar shops (FL, TX, NY, NJ, CA, etc.)\n` +
+      `  - Boutique / curated online cigar stores\n` +
+      `  - Direct-from-manufacturer sites if applicable\n\n` +
+      `Surface 15-30 listings from specialty retailers. Return the JSON ` +
+      `array exactly as specified — your entire response must be the JSON ` +
+      `array, nothing else.\n\n` + reminder;
+  } else if (mode === "gapfill" && excludeDomains.length) {
+    userMessage =
+      `Find current online cigar listings for: "${query}"\n\n` +
+      `We already have listings from these retailers, so DO NOT return ` +
       `more results from these domains — focus this entire search on OTHER ` +
       `retailers we haven't hit yet:\n` +
       excludeDomains.map((d) => `- ${d}`).join("\n") +
-      `\n\nFind 15-30 listings from DIFFERENT retailers. Strategies:\n` +
-      `  - Run "<query> cigars" + the names of specialty cigar shops you ` +
-      `know of (not the big chains above)\n` +
-      `  - Try regional retailers (Florida, Texas, NJ, NY cigar shops)\n` +
-      `  - Try boutique / curated online cigar stores\n` +
-      `  - Try direct-from-manufacturer sites if applicable\n` +
-      `  - Try "<query> cigars buy" + "site:" with smaller domains\n` +
-      `Go deeper into the search results than you normally would. If a ` +
-      `retailer above appears again, skip it — only return listings from ` +
-      `domains NOT in the list above.`
-    : baseMessage;
+      `\n\nFind 10-25 listings from DIFFERENT retailers — anywhere a US ` +
+      `customer can buy "${query}" cigars online that isn't in the list ` +
+      `above. Dig past the first page of Google results. Try smaller ` +
+      `regional retailers, niche specialty shops, and online-only stores.\n\n` +
+      `Return the JSON array exactly as specified — your entire response ` +
+      `must be the JSON array, nothing else.\n\n` + reminder;
+  } else {
+    userMessage =
+      `Find current online cigar listings for: "${query}"\n\n` +
+      `Search the open web. Surface 20-30 listings across as many distinct ` +
+      `retailers as you can — variety matters. Return the JSON array ` +
+      `exactly as specified — your entire response must be the JSON array, ` +
+      `nothing else.\n\n` + reminder;
+  }
 
   const response = await ai.models.generateContent({
     model: MODEL,
@@ -151,14 +172,22 @@ async function searchWithGemini(query, opts = {}) {
     sourceType: "ai",
   }));
 
-  // Verify each URL actually resolves. Gemini sometimes constructs plausible
-  // product URLs that 404. Drop items whose URL doesn't return a successful
-  // response so users never see a broken link.
+  // Verify each URL actually resolves and pull in-stock status from the
+  // page. Gemini sometimes constructs plausible URLs that 404 and almost
+  // always guesses inStock=true, so we override both with what we
+  // actually see on the page.
   const verifications = await Promise.all(
-    prelim.map(async (it) => ({ item: it, ok: await verifyUrl(it.url) }))
+    prelim.map(async (it) => ({ item: it, v: await verifyUrl(it.url) }))
   );
-  const cleaned = verifications.filter((v) => v.ok).map((v) => v.item);
-  const droppedUrls = verifications.filter((v) => !v.ok).map((v) => v.item.url);
+  const cleaned = verifications
+    .filter((r) => r.v.ok)
+    .map((r) => ({
+      ...r.item,
+      inStock: r.v.inStock !== null && r.v.inStock !== undefined
+        ? r.v.inStock
+        : r.item.inStock,
+    }));
+  const droppedUrls = verifications.filter((r) => !r.v.ok).map((r) => r.item.url);
 
   const groundingMeta = response?.candidates?.[0]?.groundingMetadata || null;
   const searchQueries = groundingMeta?.webSearchQueries || [];
@@ -181,49 +210,79 @@ async function searchWithGemini(query, opts = {}) {
   };
 }
 
-// Run two Gemini passes back-to-back to maximize retailer coverage. Pass 1
-// does a broad search. Pass 2 is told which domains pass 1 already covered
-// and is asked to focus on OTHER retailers (specialty / regional / boutique
-// shops Gemini might otherwise skip). Results are merged and deduped by
-// canonical URL so a retailer appearing in both passes only shows up once.
-async function searchTwoPasses(query) {
-  const pass1 = await searchWithGemini(query);
+// Run three Gemini passes for maximum retailer coverage. Pass 1 (broad)
+// and pass 2 (specialty/boutique, no big chains) run in parallel — they
+// target disjoint parts of the retailer landscape, so there's no data
+// dependency. Pass 3 (gapfill) runs sequentially after, told which
+// domains 1+2 already covered, and goes hunting for anything still
+// missing. Total latency ≈ 2 passes' worth (the parallel pair finishes
+// first, then pass 3); total coverage ≈ 3 passes. Results deduped by
+// canonical URL across all three.
+async function searchThreePasses(query) {
+  const [pass1, pass2] = await Promise.all([
+    searchWithGemini(query, { mode: "broad" }),
+    searchWithGemini(query, { mode: "specialty" }),
+  ]);
 
-  const seenDomains = uniqueDomains(pass1.results);
-  const pass2 = await searchWithGemini(query, { excludeDomains: seenDomains });
+  const seenDomains = uniqueDomains([...pass1.results, ...pass2.results]);
+  const pass3 = await searchWithGemini(query, {
+    mode: "gapfill",
+    excludeDomains: seenDomains,
+  });
 
-  const merged = dedupeByUrl([...pass1.results, ...pass2.results]);
+  const merged = dedupeByUrl([...pass1.results, ...pass2.results, ...pass3.results]);
 
   const pass1Keys = new Set(pass1.results.map((it) => canonicalUrlKey(it.url)));
+  const pass12Keys = new Set([
+    ...pass1.results.map((it) => canonicalUrlKey(it.url)),
+    ...pass2.results.map((it) => canonicalUrlKey(it.url)),
+  ]);
   const newInPass2 = pass2.results.filter(
     (it) => !pass1Keys.has(canonicalUrlKey(it.url))
+  ).length;
+  const newInPass3 = pass3.results.filter(
+    (it) => !pass12Keys.has(canonicalUrlKey(it.url))
   ).length;
 
   return {
     results: merged,
     debug: {
       model: pass1.debug.model,
-      itemCountRaw: pass1.debug.itemCountRaw + pass2.debug.itemCountRaw,
+      itemCountRaw:
+        pass1.debug.itemCountRaw + pass2.debug.itemCountRaw + pass3.debug.itemCountRaw,
       itemCountClean: merged.length,
       itemCountFromPass1: pass1.results.length,
       itemCountFromPass2: pass2.results.length,
+      itemCountFromPass3: pass3.results.length,
       itemCountNewInPass2: newInPass2,
-      pass1Domains: seenDomains,
+      itemCountNewInPass3: newInPass3,
+      pass1Domains: uniqueDomains(pass1.results),
       pass2Domains: uniqueDomains(pass2.results),
+      pass3Domains: uniqueDomains(pass3.results),
       searchQueries: [
         ...(pass1.debug.searchQueries || []),
         ...(pass2.debug.searchQueries || []),
+        ...(pass3.debug.searchQueries || []),
       ],
       sources: [
         ...(pass1.debug.sources || []),
         ...(pass2.debug.sources || []),
+        ...(pass3.debug.sources || []),
       ],
-      usage: { pass1: pass1.debug.usage, pass2: pass2.debug.usage },
+      usage: {
+        pass1: pass1.debug.usage,
+        pass2: pass2.debug.usage,
+        pass3: pass3.debug.usage,
+      },
       droppedUrls: [
         ...(pass1.debug.droppedUrls || []),
         ...(pass2.debug.droppedUrls || []),
+        ...(pass3.debug.droppedUrls || []),
       ],
-      rawText: `--- PASS 1 ---\n${pass1.debug.rawText}\n\n--- PASS 2 ---\n${pass2.debug.rawText}`,
+      rawText:
+        `--- PASS 1 (broad) ---\n${pass1.debug.rawText}\n\n` +
+        `--- PASS 2 (specialty) ---\n${pass2.debug.rawText}\n\n` +
+        `--- PASS 3 (gapfill) ---\n${pass3.debug.rawText}`,
     },
   };
 }
@@ -262,18 +321,21 @@ function uniqueDomains(items) {
   return [...set];
 }
 
-// Verify a URL points to a real, specific product page. Drops:
+// Verify a URL points to a real, specific product page and determine its
+// in-stock status. Returns { ok, inStock } — ok=false drops the listing
+// entirely; inStock is true / false / null where null means "no signal,
+// fall back to whatever Gemini said". Drops the URL if:
 //   - 4xx/5xx responses
 //   - final URLs that look like /404, /not-found, /search?q=, etc.
 //   - "soft 404" pages (HTTP 200 with "Page Not Found" in <title>/<h1>)
-//   - category / listing / brand-landing pages (JSON-LD CollectionPage /
-//     ItemList / SearchResultsPage, or og:type=website with many product
-//     cards) so the user lands on a specific cigar, not a brand index
+//   - category / listing / brand-landing pages (CollectionPage /
+//     SearchResultsPage / og:type=website with many product cards) so
+//     the user lands on a specific cigar, not a brand index
 // GETs the first 128KB so JSON-LD blocks lower in <head> still get seen.
 async function verifyUrl(url) {
-  if (!url || typeof url !== "string") return false;
-  if (urlLooksLikeSearchOrCategory(url)) return false;
-  if (urlLooksLikeKnownNonProduct(url)) return false;
+  if (!url || typeof url !== "string") return { ok: false };
+  if (urlLooksLikeSearchOrCategory(url)) return { ok: false };
+  if (urlLooksLikeKnownNonProduct(url)) return { ok: false };
 
   const headers = {
     "User-Agent":
@@ -296,12 +358,12 @@ async function verifyUrl(url) {
       signal: ctrl.signal,
     });
 
-    if (resp.status < 200 || resp.status >= 400) return false;
+    if (resp.status < 200 || resp.status >= 400) return { ok: false };
     const finalUrl = resp.url || url;
-    if (looksLikeNotFoundUrl(finalUrl)) return false;
-    if (urlLooksLikeSearchOrCategory(finalUrl)) return false;
-    if (urlLooksLikeKnownNonProduct(finalUrl)) return false;
-    if (redirectedToRoot(url, finalUrl)) return false;
+    if (looksLikeNotFoundUrl(finalUrl)) return { ok: false };
+    if (urlLooksLikeSearchOrCategory(finalUrl)) return { ok: false };
+    if (urlLooksLikeKnownNonProduct(finalUrl)) return { ok: false };
+    if (redirectedToRoot(url, finalUrl)) return { ok: false };
 
     let body = "";
     try {
@@ -309,17 +371,49 @@ async function verifyUrl(url) {
     } catch (_) {
       // Status was OK but body couldn't be read — accept rather than
       // drop a potentially good listing.
-      return true;
+      return { ok: true, inStock: null };
     }
-    if (looksLikeNotFoundBody(body)) return false;
-    if (looksLikeListingPage(body)) return false;
-    if (h1LooksLikeBrandListing(body)) return false;
-    return true;
+    if (looksLikeNotFoundBody(body)) return { ok: false };
+    if (looksLikeListingPage(body)) return { ok: false };
+    if (h1LooksLikeBrandListing(body)) return { ok: false };
+    return { ok: true, inStock: determineInStock(body) };
   } catch (_) {
-    return false;
+    return { ok: false };
   } finally {
     clearTimeout(timer);
   }
+}
+
+// Determine in-stock status from the actual page body. Prefers
+// Schema.org Offer.availability — the standard product-page signal —
+// and falls back to scanning for "out of stock" / "sold out" /
+// "currently unavailable" / "notify me when available" markers. Returns
+// true (in stock), false (out of stock), or null (no signal — caller
+// keeps whatever Gemini said). With multiple Offer variants, any single
+// in-stock variant wins, since the listing is still partially buyable.
+function determineInStock(body) {
+  if (!body || typeof body !== "string") return null;
+
+  // Schema.org availability — used by most modern e-commerce
+  const availabilityMatches =
+    body.match(/"availability"\s*:\s*"([^"]+)"/gi) || [];
+  let sawInStock = false;
+  let sawOutOfStock = false;
+  for (const m of availabilityMatches) {
+    const raw = (m.match(/"availability"\s*:\s*"([^"]+)"/i) || [])[1] || "";
+    const norm = raw.toLowerCase().replace(/^https?:\/\/schema\.org\//, "").trim();
+    if (/outofstock|discontinued|soldout|backorder/.test(norm)) sawOutOfStock = true;
+    if (/instock|onlineonly|limitedavailability|instoreonly|preorder/.test(norm)) sawInStock = true;
+  }
+  if (sawInStock) return true;
+  if (sawOutOfStock) return false;
+
+  // Body-text fallback for sites without JSON-LD availability
+  if (/\bout\s+of\s+stock\b|\bsold\s+out\b|\bcurrently\s+unavailable\b|\bnotify\s+me\s+when\s+(?:this\s+is\s+)?(?:available|back\s+in\s+stock)\b|\btemporarily\s+(?:out\s+of\s+stock|unavailable)\b/i.test(body)) {
+    return false;
+  }
+
+  return null;
 }
 
 // URL-level filter for obvious search pages. Conservative — only matches
@@ -552,13 +646,15 @@ app.get("/search", async (req, res) => {
 
   console.log(`[search] query: "${query}" model=${MODEL}`);
   try {
-    const { results, debug } = await searchTwoPasses(query);
+    const { results, debug } = await searchThreePasses(query);
     const sorted = sortByPrice(results);
     const byStore = sorted.reduce((acc, r) => ((acc[r.store] = (acc[r.store] || 0) + 1), acc), {});
     console.log(
       `[search] returned ${sorted.length} results ` +
         `(pass1=${debug.itemCountFromPass1}, pass2=${debug.itemCountFromPass2}, ` +
+        `pass3=${debug.itemCountFromPass3}, ` +
         `newInPass2=${debug.itemCountNewInPass2}, ` +
+        `newInPass3=${debug.itemCountNewInPass3}, ` +
         `droppedBrokenUrls=${debug.droppedUrls.length}, ` +
         `searches=${debug.searchQueries.length}) ` +
         `byStore=${JSON.stringify(byStore)}`
@@ -578,7 +674,7 @@ app.get("/debug", async (req, res) => {
 
   console.log(`[debug] query: "${query}"`);
   try {
-    const { results, debug } = await searchTwoPasses(query);
+    const { results, debug } = await searchThreePasses(query);
     const byStore = results.reduce((acc, r) => ((acc[r.store] = (acc[r.store] || 0) + 1), acc), {});
     res.json({
       query,
@@ -587,9 +683,12 @@ app.get("/debug", async (req, res) => {
       itemCountClean: debug.itemCountClean,
       itemCountFromPass1: debug.itemCountFromPass1,
       itemCountFromPass2: debug.itemCountFromPass2,
+      itemCountFromPass3: debug.itemCountFromPass3,
       itemCountNewInPass2: debug.itemCountNewInPass2,
+      itemCountNewInPass3: debug.itemCountNewInPass3,
       pass1Domains: debug.pass1Domains,
       pass2Domains: debug.pass2Domains,
+      pass3Domains: debug.pass3Domains,
       byStore,
       searchQueries: debug.searchQueries,
       sources: debug.sources,
