@@ -273,6 +273,7 @@ function uniqueDomains(items) {
 async function verifyUrl(url) {
   if (!url || typeof url !== "string") return false;
   if (urlLooksLikeSearchOrCategory(url)) return false;
+  if (urlLooksLikeKnownNonProduct(url)) return false;
 
   const headers = {
     "User-Agent":
@@ -299,6 +300,7 @@ async function verifyUrl(url) {
     const finalUrl = resp.url || url;
     if (looksLikeNotFoundUrl(finalUrl)) return false;
     if (urlLooksLikeSearchOrCategory(finalUrl)) return false;
+    if (urlLooksLikeKnownNonProduct(finalUrl)) return false;
     if (redirectedToRoot(url, finalUrl)) return false;
 
     let body = "";
@@ -311,6 +313,7 @@ async function verifyUrl(url) {
     }
     if (looksLikeNotFoundBody(body)) return false;
     if (looksLikeListingPage(body)) return false;
+    if (h1LooksLikeBrandListing(body)) return false;
     return true;
   } catch (_) {
     return false;
@@ -335,6 +338,51 @@ function urlLooksLikeSearchOrCategory(url) {
   } catch (_) {
     return false;
   }
+}
+
+// Per-retailer product-URL patterns. For retailers whose product pages
+// follow a strict, well-known URL shape, any URL that doesn't match the
+// shape is reliably a category/brand-landing page (e.g.
+// jrcigars.com/cigars/handmade-cigars/padron-cigars/) or a URL Gemini
+// fabricated by guessing a plausible slug. Either way we drop it before
+// even hitting the network. Add a retailer here only if EVERY real
+// product on the site matches one of its patterns.
+const RETAILER_PRODUCT_PATH = {
+  // JR Cigars: every product page lives at /item/<category>/<line>/<SKU>.html
+  // — anything else (e.g. /padron-cigars, /cigars/handmade-cigars/...) is
+  // a brand index or a non-existent URL.
+  "jrcigars.com": [/^\/item\/.+\.html?$/i],
+};
+
+function urlLooksLikeKnownNonProduct(url) {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase().replace(/^www\./, "");
+    const patterns = RETAILER_PRODUCT_PATH[host];
+    if (!patterns) return false;
+    return !patterns.some((p) => p.test(u.pathname));
+  } catch (_) {
+    return false;
+  }
+}
+
+// Brand-landing page detection: real cigar product page h1s are the
+// specific product name ("Padron 1964 Anniversary No. 4 5-Pack"). Brand
+// listing h1s are just "<Brand> Cigars" with a short brand name in
+// front. Catches retailer brand index pages that pass the JSON-LD check
+// (e.g. they have a few embedded Product cards but render as "all
+// Padron cigars" lists). Requires ≤ 3 words before "Cigars" so real
+// product names that happen to end in "Cigars" survive.
+function h1LooksLikeBrandListing(body) {
+  if (!body || typeof body !== "string") return false;
+  const h1Match = body.match(/<h1\b[^>]*>([\s\S]{0,200}?)<\/h1>/i);
+  if (!h1Match) return false;
+  const h1 = h1Match[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  if (!/\s+cigars?$/i.test(h1)) return false;
+  const stem = h1.replace(/\s+cigars?$/i, "").trim();
+  if (!stem) return false;
+  const wordCount = stem.split(/\s+/).filter(Boolean).length;
+  return wordCount <= 3;
 }
 
 // Detect category/listing/brand-landing pages so users don't get sent to
@@ -400,7 +448,7 @@ function looksLikeNotFoundUrl(url) {
 // very surprising, so they're a strong signal the URL is dead even when
 // the server returned HTTP 200.
 const NOT_FOUND_RE =
-  /page\s+not\s+found|404\s+not\s+found|not\s+found\s*[-—|:]\s*404|404\s+error|error\s+404|404\s*[-—|:]\s*(?:not\s+found|error|page)|page\s+(?:doesn'?t|does\s+not)\s+exist|we\s+(?:can'?t|cannot|couldn'?t|could\s+not)\s+find\s+(?:that|the|this|what|the\s+page|the\s+product|any\s+product)|sorry,?\s+(?:we\s+)?(?:can'?t|cannot|couldn'?t|could\s+not)\s+find|the\s+page\s+you'?re\s+looking\s+for|(?:product|item|listing)\s+(?:is\s+)?(?:not\s+found|unavailable|no\s+longer\s+available)|this\s+page\s+(?:is\s+)?(?:no\s+longer\s+)?(?:available|unavailable)|page\s+(?:has\s+been\s+)?(?:moved|removed|deleted)|(?:hmm|oops|whoops|yikes)[.,!]?\s+(?:we|something|this|page|sorry)/i;
+  /page\s+not\s+found|404\s+not\s+found|not\s+found\s*[-—|:]\s*404|404\s+error|error\s+404|404\s*[-—|:]\s*(?:not\s+found|error|page)|page\s+(?:doesn'?t|does\s+not)\s+exist|(?:we|you|i)\s+(?:can'?t|cannot|couldn'?t|could\s+not)\s+find|sorry,?\s+(?:we\s+)?(?:can'?t|cannot|couldn'?t|could\s+not)\s+find|(?:the\s+)?(?:page|product|cigar|item|what)\s+you'?re\s+looking\s+for|(?:product|item|listing)\s+(?:is\s+)?(?:not\s+found|unavailable|no\s+longer\s+available)|this\s+page\s+(?:is\s+)?(?:no\s+longer\s+)?(?:available|unavailable)|page\s+(?:has\s+been\s+)?(?:moved|removed|deleted)|(?:hmm|oops|whoops|yikes)[.,!]?\s+(?:we|something|this|page|sorry)/i;
 
 function looksLikeNotFoundBody(body) {
   if (!body || typeof body !== "string") return false;
