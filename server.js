@@ -36,7 +36,7 @@ Run multiple Google searches to get good coverage:
        site:famous-smoke.com, site:holts.com, site:smallbatchcigar.com,
        site:cigarpage.com, site:atlanticcigar.com, site:bestcigarprices.com, etc.
 
-Aim to surface 10-25 listings total across as many distinct retailers as you can find. Variety of retailers matters more than depth at one retailer — the goal is best-price comparison.
+Aim to surface 20-40 listings total across as many distinct retailers as you can find. Variety of retailers matters more than depth at one retailer — the goal is best-price comparison. More is better.
 
 OUTPUT FORMAT
 Your final response MUST be ONLY a JSON array — no prose, no preamble, no markdown code fences, no commentary. The first character must be '[' and the last must be ']'.
@@ -57,27 +57,59 @@ HARD RULES
 - "store" should be the human-readable retailer name, derived from the page title or the domain (e.g. jrcigars.com → "JR Cigars", famous-smoke.com → "Famous Smoke Shop").
 - "price" must start with "$" followed by a number (e.g. "$24.99", "$189").
 - "url" MUST be copied character-for-character from the actual Google Search result URL. Do NOT construct, guess, shorten, or modify URLs in any way. If you do not have an exact confirmed product page URL from your search results, omit that listing entirely — a missing listing is better than a broken link.
-- "url" must point to a specific product page on the retailer's domain — not a category page, search results page, or aggregator/comparison site.
 - Skip auction sites (eBay listings vary), marketplaces (Amazon, Walmart unless they're the retailer), and review/news articles.
-- Set "inStock" to false ONLY if the listing explicitly says "out of stock" or "sold out". Otherwise true.`;
+- Set "inStock" to false ONLY if the listing explicitly says "out of stock" or "sold out". Otherwise true.
+
+URL STRICTNESS — READ CAREFULLY
+Every "url" MUST go directly to ONE specific cigar product page where a user can add that exact cigar to their cart. NOT a brand page, category page, search page, or listing page.
+
+  GOOD (specific product, user can buy this exact cigar):
+    https://www.jrcigars.com/padron-1964-anniversary-maduro-no-4-5-pack
+    https://www.famous-smoke.com/padron+1964+anniversary+natural+no.+4/item/PAD1964N4
+    https://www.cigarsinternational.com/p/padron-1964-anniversary-maduro-no-4/2024212/
+    https://www.holts.com/padron-1964-anniversary-maduro-no-4.html
+
+  BAD (brand/category landing — sends user to a list, not a cigar):
+    https://www.jrcigars.com/padron-cigars
+    https://www.jrcigars.com/shop/padron
+    https://www.jrcigars.com/brands/padron
+    https://www.famous-smoke.com/padron-cigars
+    https://www.cigarsinternational.com/c/padron-cigars/
+    https://www.holts.com/padron.html
+
+  BAD (search results page):
+    https://www.jrcigars.com/search?q=padron
+    https://www.famous-smoke.com/searchresults.aspx?q=padron
+
+A valid product URL almost always contains the specific cigar's identifying details — vitola/size (e.g. "no-4", "robusto", "toro"), wrapper (e.g. "maduro", "natural"), and/or pack count (e.g. "5-pack", "box-of-20"), or a unique numeric/SKU product ID. If your URL doesn't pin down a specific cigar SKU, OMIT that listing.`;
 
 async function searchWithGemini(query, opts = {}) {
   const excludeDomains = Array.isArray(opts.excludeDomains) ? opts.excludeDomains : [];
 
   const baseMessage =
     `Find current online cigar listings for: "${query}"\n\n` +
-    `Search the open web. Surface 10-25 listings across as many distinct ` +
-    `retailers as you can. Return the JSON array exactly as specified — your ` +
-    `entire response must be the JSON array, nothing else.`;
+    `Search the open web. Surface 20-40 listings across as many distinct ` +
+    `retailers as you can — variety matters. Return the JSON array exactly ` +
+    `as specified — your entire response must be the JSON array, nothing else.\n\n` +
+    `Reminder: every URL must go to a SPECIFIC cigar product page, not a ` +
+    `brand/category landing page. If you only have a brand URL, skip that listing.`;
 
   const userMessage = excludeDomains.length
     ? baseMessage +
-      `\n\nWe already have listings from these retailers:\n` +
+      `\n\nWe already have listings from these retailers, so DO NOT return ` +
+      `more results from these domains — focus this entire search on OTHER ` +
+      `retailers we haven't hit yet:\n` +
       excludeDomains.map((d) => `- ${d}`).join("\n") +
-      `\n\nPlease prioritize finding listings from OTHER retailers we ` +
-      `haven't covered yet — smaller specialty cigar shops, regional ` +
-      `retailers, boutique online stores, etc. Cast a wide net. If the ` +
-      `same product appears on a new retailer at a different price, include it.`
+      `\n\nFind 15-30 listings from DIFFERENT retailers. Strategies:\n` +
+      `  - Run "<query> cigars" + the names of specialty cigar shops you ` +
+      `know of (not the big chains above)\n` +
+      `  - Try regional retailers (Florida, Texas, NJ, NY cigar shops)\n` +
+      `  - Try boutique / curated online cigar stores\n` +
+      `  - Try direct-from-manufacturer sites if applicable\n` +
+      `  - Try "<query> cigars buy" + "site:" with smaller domains\n` +
+      `Go deeper into the search results than you normally would. If a ` +
+      `retailer above appears again, skip it — only return listings from ` +
+      `domains NOT in the list above.`
     : baseMessage;
 
   const response = await ai.models.generateContent({
@@ -86,8 +118,10 @@ async function searchWithGemini(query, opts = {}) {
     config: {
       systemInstruction: SYSTEM_PROMPT,
       tools: [{ googleSearch: {} }],
-      // Pinned to 0 for deterministic output across runs
-      temperature: 0,
+      // Pass 1 is deterministic (temp 0). Pass 2 explores — a small
+      // temperature lets it phrase search queries differently and dig
+      // past the same top-10 search results pass 1 always lands on.
+      temperature: excludeDomains.length ? 0.4 : 0,
     },
   });
 
@@ -227,16 +261,18 @@ function uniqueDomains(items) {
   return [...set];
 }
 
-// Verify a URL points to a real product page. Many retailers serve "soft
-// 404" pages — HTTP 200 with a "Page Not Found" body — for missing
-// products, so a status-only check lets broken links through to users.
-// This GETs the first 64KB, follows redirects with a browser-like
-// User-Agent, then rejects if:
-//   - status is 4xx/5xx
-//   - the final URL path looks like /404, /not-found, etc.
-//   - <title> or <h1> contains "page not found" / "404 error" markers
+// Verify a URL points to a real, specific product page. Drops:
+//   - 4xx/5xx responses
+//   - final URLs that look like /404, /not-found, /search?q=, etc.
+//   - "soft 404" pages (HTTP 200 with "Page Not Found" in <title>/<h1>)
+//   - category / listing / brand-landing pages (JSON-LD CollectionPage /
+//     ItemList / SearchResultsPage, or og:type=website with many product
+//     cards) so the user lands on a specific cigar, not a brand index
+// GETs the first 128KB so JSON-LD blocks lower in <head> still get seen.
 async function verifyUrl(url) {
   if (!url || typeof url !== "string") return false;
+  if (urlLooksLikeSearchOrCategory(url)) return false;
+
   const headers = {
     "User-Agent":
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
@@ -245,7 +281,7 @@ async function verifyUrl(url) {
       "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif," +
       "image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Range": "bytes=0-65535",
+    "Range": "bytes=0-131071",
   };
 
   const ctrl = new AbortController();
@@ -259,7 +295,9 @@ async function verifyUrl(url) {
     });
 
     if (resp.status < 200 || resp.status >= 400) return false;
-    if (looksLikeNotFoundUrl(resp.url || url)) return false;
+    const finalUrl = resp.url || url;
+    if (looksLikeNotFoundUrl(finalUrl)) return false;
+    if (urlLooksLikeSearchOrCategory(finalUrl)) return false;
 
     let body = "";
     try {
@@ -269,12 +307,81 @@ async function verifyUrl(url) {
       // drop a potentially good listing.
       return true;
     }
-    return !looksLikeNotFoundBody(body);
+    if (looksLikeNotFoundBody(body)) return false;
+    if (looksLikeListingPage(body)) return false;
+    return true;
   } catch (_) {
     return false;
   } finally {
     clearTimeout(timer);
   }
+}
+
+// URL-level filter for obvious search/category pages. Conservative — only
+// matches patterns that are essentially never product pages on any site.
+function urlLooksLikeSearchOrCategory(url) {
+  try {
+    const u = new URL(url);
+    const sp = u.searchParams;
+    if (sp.has("q") || sp.has("query") || sp.has("search") || sp.has("s") || sp.has("keyword")) {
+      return true;
+    }
+    const path = u.pathname.toLowerCase();
+    if (/\/search(?:\/|$|\.\w+)/.test(path)) return true;
+    if (/\/searchresults(?:\.|\/|$)/.test(path)) return true;
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Detect category/listing/brand-landing pages so users don't get sent to
+// a "browse all Padron" index instead of a specific cigar. Looks at
+// JSON-LD schema, og:type, and title patterns. Designed to be
+// conservative — only returns true when there's strong evidence the page
+// is a listing rather than an individual product.
+function looksLikeListingPage(body) {
+  if (!body || typeof body !== "string") return false;
+
+  let productCount = 0;
+  let hasItemList = false;
+  let hasCollectionPage = false;
+  let hasSearchResultsPage = false;
+  const jsonLdBlocks =
+    body.match(/<script[^>]*type=["']application\/ld\+json["'][^>]*>[\s\S]*?<\/script>/gi) ||
+    [];
+  for (const block of jsonLdBlocks) {
+    productCount += (block.match(/"@type"\s*:\s*"Product"/gi) || []).length;
+    if (/"@type"\s*:\s*"ItemList"/i.test(block)) hasItemList = true;
+    if (/"@type"\s*:\s*"CollectionPage"/i.test(block)) hasCollectionPage = true;
+    if (/"@type"\s*:\s*"SearchResultsPage"/i.test(block)) hasSearchResultsPage = true;
+  }
+
+  const ogTypeMatch =
+    body.match(/<meta[^>]+(?:property|name)\s*=\s*["']og:type["'][^>]+content\s*=\s*["']([^"']+)["']/i) ||
+    body.match(/<meta[^>]+content\s*=\s*["']([^"']+)["'][^>]+(?:property|name)\s*=\s*["']og:type["']/i);
+  const ogType = ogTypeMatch ? ogTypeMatch[1].toLowerCase().trim() : "";
+
+  // Clear product signals → keep the URL.
+  if (ogType.startsWith("product")) return false;
+  if (productCount === 1) return false;
+
+  // Clear listing signals → drop the URL.
+  if (hasSearchResultsPage) return true;
+  if (hasCollectionPage && productCount === 0) return true;
+  if (hasItemList && productCount === 0) return true;
+  // Many embedded Product cards with no single dominant product = listing.
+  if (productCount >= 8) return true;
+
+  const titleMatch = body.match(/<title[^>]*>([\s\S]{0,300}?)<\/title>/i);
+  if (titleMatch) {
+    const title = titleMatch[1].replace(/<[^>]+>/g, " ").trim();
+    if (/\bpage\s+\d+\s+of\s+\d+\b/i.test(title)) return true;
+    if (/\bshowing\s+\d+\s+(?:of|results|products|items)\b/i.test(title)) return true;
+    if (/\b\d+\s+(?:results|products|items)\s+(?:found|available)\b/i.test(title)) return true;
+  }
+
+  return false;
 }
 
 function looksLikeNotFoundUrl(url) {
