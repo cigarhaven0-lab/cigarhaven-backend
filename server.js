@@ -118,10 +118,11 @@ async function searchWithGemini(query, opts = {}) {
     config: {
       systemInstruction: SYSTEM_PROMPT,
       tools: [{ googleSearch: {} }],
-      // Pass 1 is deterministic (temp 0). Pass 2 explores — a small
-      // temperature lets it phrase search queries differently and dig
-      // past the same top-10 search results pass 1 always lands on.
-      temperature: excludeDomains.length ? 0.4 : 0,
+      // Both passes run deterministic — temperature > 0 made Gemini
+      // hallucinate URLs that 404 (it would "guess" plausible product
+      // slugs instead of sticking to URLs Google Search actually
+      // returned). The different prompt is enough to make pass 2 differ.
+      temperature: 0,
     },
   });
 
@@ -298,6 +299,7 @@ async function verifyUrl(url) {
     const finalUrl = resp.url || url;
     if (looksLikeNotFoundUrl(finalUrl)) return false;
     if (urlLooksLikeSearchOrCategory(finalUrl)) return false;
+    if (redirectedToRoot(url, finalUrl)) return false;
 
     let body = "";
     try {
@@ -317,15 +319,15 @@ async function verifyUrl(url) {
   }
 }
 
-// URL-level filter for obvious search/category pages. Conservative — only
-// matches patterns that are essentially never product pages on any site.
+// URL-level filter for obvious search pages. Conservative — only matches
+// patterns that are essentially never product pages on any site. (`s` and
+// `keyword` params look like search but also commonly mean session-id or
+// other things, so we don't use them.)
 function urlLooksLikeSearchOrCategory(url) {
   try {
     const u = new URL(url);
     const sp = u.searchParams;
-    if (sp.has("q") || sp.has("query") || sp.has("search") || sp.has("s") || sp.has("keyword")) {
-      return true;
-    }
+    if (sp.has("q") || sp.has("query") || sp.has("search")) return true;
     const path = u.pathname.toLowerCase();
     if (/\/search(?:\/|$|\.\w+)/.test(path)) return true;
     if (/\/searchresults(?:\.|\/|$)/.test(path)) return true;
@@ -336,15 +338,15 @@ function urlLooksLikeSearchOrCategory(url) {
 }
 
 // Detect category/listing/brand-landing pages so users don't get sent to
-// a "browse all Padron" index instead of a specific cigar. Looks at
-// JSON-LD schema, og:type, and title patterns. Designed to be
-// conservative — only returns true when there's strong evidence the page
-// is a listing rather than an individual product.
+// a "browse all Padron" index instead of a specific cigar. Only drops on
+// strong evidence — ItemList alone isn't enough (many real product pages
+// use ItemList for breadcrumbs or related-product carousels), and the
+// Product card count threshold is generous so product pages with big
+// "you may also like" sections aren't misclassified.
 function looksLikeListingPage(body) {
   if (!body || typeof body !== "string") return false;
 
   let productCount = 0;
-  let hasItemList = false;
   let hasCollectionPage = false;
   let hasSearchResultsPage = false;
   const jsonLdBlocks =
@@ -352,7 +354,6 @@ function looksLikeListingPage(body) {
     [];
   for (const block of jsonLdBlocks) {
     productCount += (block.match(/"@type"\s*:\s*"Product"/gi) || []).length;
-    if (/"@type"\s*:\s*"ItemList"/i.test(block)) hasItemList = true;
     if (/"@type"\s*:\s*"CollectionPage"/i.test(block)) hasCollectionPage = true;
     if (/"@type"\s*:\s*"SearchResultsPage"/i.test(block)) hasSearchResultsPage = true;
   }
@@ -364,14 +365,13 @@ function looksLikeListingPage(body) {
 
   // Clear product signals → keep the URL.
   if (ogType.startsWith("product")) return false;
-  if (productCount === 1) return false;
+  if (productCount >= 1 && productCount <= 14) return false;
 
   // Clear listing signals → drop the URL.
   if (hasSearchResultsPage) return true;
   if (hasCollectionPage && productCount === 0) return true;
-  if (hasItemList && productCount === 0) return true;
-  // Many embedded Product cards with no single dominant product = listing.
-  if (productCount >= 8) return true;
+  // Many Product cards with no og:type=product = listing page with cards.
+  if (productCount >= 15) return true;
 
   const titleMatch = body.match(/<title[^>]*>([\s\S]{0,300}?)<\/title>/i);
   if (titleMatch) {
@@ -395,12 +395,12 @@ function looksLikeNotFoundUrl(url) {
   }
 }
 
-// Soft-404 detection: looks for "page not found" markers in <title> and
-// <h1>. These phrases on a real cigar product page would be very
-// surprising, so they're a strong signal the URL is dead even when the
-// server returned HTTP 200.
+// Soft-404 detection: looks for "page not found" markers in <title>,
+// <h1>, and <h2>. These phrases on a real cigar product page would be
+// very surprising, so they're a strong signal the URL is dead even when
+// the server returned HTTP 200.
 const NOT_FOUND_RE =
-  /page\s+not\s+found|404\s+not\s+found|not\s+found\s*[-—|:]\s*404|404\s+error|error\s+404|404\s*[-—|:]\s*(?:not\s+found|error|page)|page\s+(?:doesn'?t|does\s+not)\s+exist|we\s+(?:can'?t|cannot|couldn'?t)\s+find\s+(?:that|the|this)|sorry,?\s+(?:we\s+)?(?:can'?t|couldn'?t)\s+find|the\s+page\s+you'?re\s+looking\s+for|product\s+(?:is\s+)?no\s+longer\s+available|this\s+page\s+(?:is\s+)?(?:no\s+longer\s+)?(?:available|unavailable)/i;
+  /page\s+not\s+found|404\s+not\s+found|not\s+found\s*[-—|:]\s*404|404\s+error|error\s+404|404\s*[-—|:]\s*(?:not\s+found|error|page)|page\s+(?:doesn'?t|does\s+not)\s+exist|we\s+(?:can'?t|cannot|couldn'?t|could\s+not)\s+find\s+(?:that|the|this|what|the\s+page|the\s+product|any\s+product)|sorry,?\s+(?:we\s+)?(?:can'?t|cannot|couldn'?t|could\s+not)\s+find|the\s+page\s+you'?re\s+looking\s+for|(?:product|item|listing)\s+(?:is\s+)?(?:not\s+found|unavailable|no\s+longer\s+available)|this\s+page\s+(?:is\s+)?(?:no\s+longer\s+)?(?:available|unavailable)|page\s+(?:has\s+been\s+)?(?:moved|removed|deleted)|(?:hmm|oops|whoops|yikes)[.,!]?\s+(?:we|something|this|page|sorry)/i;
 
 function looksLikeNotFoundBody(body) {
   if (!body || typeof body !== "string") return false;
@@ -413,14 +413,38 @@ function looksLikeNotFoundBody(body) {
     if (/^(?:404|not\s+found|404\s*[-—|:]?\s*not\s+found)\s*$/i.test(title)) return true;
   }
 
-  const h1Match = body.match(/<h1\b[^>]*>([\s\S]{0,500}?)<\/h1>/i);
-  if (h1Match) {
-    const h1 = h1Match[1].replace(/<[^>]+>/g, " ").trim();
-    if (NOT_FOUND_RE.test(h1)) return true;
-    if (/^(?:404|not\s+found|oops!?)\s*$/i.test(h1)) return true;
+  // Scan first few h1 and h2 elements — some 404 templates put the
+  // "Page Not Found" copy in h2, or have a hero h1 first and the error
+  // message in a later heading.
+  const headings = body.match(/<h[12]\b[^>]*>[\s\S]{0,500}?<\/h[12]>/gi) || [];
+  for (const m of headings.slice(0, 6)) {
+    const text = m.replace(/<[^>]+>/g, " ").trim();
+    if (!text) continue;
+    if (NOT_FOUND_RE.test(text)) return true;
+    if (/^(?:404|not\s+found|oops!?|whoops!?)\s*$/i.test(text)) return true;
   }
 
   return false;
+}
+
+// Detect "404 redirects to homepage" — some retailers respond to dead
+// product URLs by 302-ing to "/" instead of returning a real 404. The
+// final URL after redirects is the homepage; the original asked for a
+// specific product. That's a broken link from the user's perspective.
+function redirectedToRoot(originalUrl, finalUrl) {
+  try {
+    const o = new URL(originalUrl);
+    const f = new URL(finalUrl);
+    if (o.hostname.toLowerCase().replace(/^www\./, "") !==
+        f.hostname.toLowerCase().replace(/^www\./, "")) {
+      return false;
+    }
+    const oPath = o.pathname.replace(/\/+$/, "");
+    const fPath = f.pathname.replace(/\/+$/, "");
+    return (fPath === "" || fPath === "/") && oPath !== "" && oPath !== "/";
+  } catch (_) {
+    return false;
+  }
 }
 
 function parseJsonArray(text) {
