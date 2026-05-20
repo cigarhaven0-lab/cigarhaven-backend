@@ -434,27 +434,33 @@ function urlLooksLikeSearchOrCategory(url) {
   }
 }
 
-// Per-retailer product-URL patterns. For retailers whose product pages
-// follow a strict, well-known URL shape, any URL that doesn't match the
-// shape is reliably a category/brand-landing page (e.g.
-// jrcigars.com/cigars/handmade-cigars/padron-cigars/) or a URL Gemini
-// fabricated by guessing a plausible slug. Either way we drop it before
-// even hitting the network. Add a retailer here only if EVERY real
-// product on the site matches one of its patterns.
-const RETAILER_PRODUCT_PATH = {
-  // JR Cigars: every product page lives at /item/<category>/<line>/<SKU>.html
-  // — anything else (e.g. /padron-cigars, /cigars/handmade-cigars/...) is
-  // a brand index or a non-existent URL.
-  "jrcigars.com": [/^\/item\/.+\.html?$/i],
+// Per-retailer URL shapes we know are NOT product pages. This is a
+// blacklist (drop URLs matching these) rather than a whitelist (only
+// allow these), because retailers often have several product-URL
+// shapes — listing them all is impossible and a whitelist would drop
+// real products that happen to use a shape we haven't catalogued.
+// What we DO know reliably is which paths are categories / brand
+// indexes / known error pages. Drop only those.
+const RETAILER_NON_PRODUCT_PATTERNS = {
+  // JR Cigars: category paths live under /cigars/..., brand indexes are
+  // single-segment slugs ending in -cigars (e.g. /padron-cigars), and
+  // /not_found is the explicit 404 page. Everything else (including
+  // /item/.../*.html, /<sku>, /<product-slug>, etc.) we let through and
+  // rely on the page-content checks to validate.
+  "jrcigars.com": [
+    /^\/cigars(?:\/|$)/i,
+    /^\/[\w-]+-cigars?\/?$/i,
+    /^\/not_?found(?:\/|$)/i,
+  ],
 };
 
 function urlLooksLikeKnownNonProduct(url) {
   try {
     const u = new URL(url);
     const host = u.hostname.toLowerCase().replace(/^www\./, "");
-    const patterns = RETAILER_PRODUCT_PATH[host];
+    const patterns = RETAILER_NON_PRODUCT_PATTERNS[host];
     if (!patterns) return false;
-    return !patterns.some((p) => p.test(u.pathname));
+    return patterns.some((p) => p.test(u.pathname));
   } catch (_) {
     return false;
   }
@@ -463,10 +469,10 @@ function urlLooksLikeKnownNonProduct(url) {
 // Brand-landing page detection: real cigar product page h1s are the
 // specific product name ("Padron 1964 Anniversary No. 4 5-Pack"). Brand
 // listing h1s are just "<Brand> Cigars" with a short brand name in
-// front. Catches retailer brand index pages that pass the JSON-LD check
-// (e.g. they have a few embedded Product cards but render as "all
-// Padron cigars" lists). Requires ≤ 3 words before "Cigars" so real
-// product names that happen to end in "Cigars" survive.
+// front. Only fires when BOTH (a) the h1 matches the "<short> Cigars"
+// pattern AND (b) the page contains multiple Product schemas — so a
+// real product page that happens to be called "Caldwell Sampler Cigars"
+// (which would have a single Product schema) survives.
 function h1LooksLikeBrandListing(body) {
   if (!body || typeof body !== "string") return false;
   const h1Match = body.match(/<h1\b[^>]*>([\s\S]{0,200}?)<\/h1>/i);
@@ -476,7 +482,10 @@ function h1LooksLikeBrandListing(body) {
   const stem = h1.replace(/\s+cigars?$/i, "").trim();
   if (!stem) return false;
   const wordCount = stem.split(/\s+/).filter(Boolean).length;
-  return wordCount <= 3;
+  if (wordCount > 3) return false;
+  // Confirming signal: multiple Product cards = actually a listing
+  const productCount = (body.match(/"@type"\s*:\s*"Product"/gi) || []).length;
+  return productCount >= 3;
 }
 
 // Detect category/listing/brand-landing pages so users don't get sent to
